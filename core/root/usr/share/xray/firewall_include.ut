@@ -1,7 +1,7 @@
 #!/usr/bin/utpl
 {%
     "use strict";
-    import { stat } from "fs";
+    import { stat, readfile } from "fs";
     import { load_config } from "./common/config.mjs";
     import { dns_direct_servers } from "./feature/dns.mjs";
     const ignore_tp_spec_def_gw = stat("/usr/share/xray/ignore_tp_spec_def_gw");
@@ -15,10 +15,27 @@
     const uids_direct = uniq(general.uids_direct || []);
     const gids_direct = uniq(general.gids_direct || []);
     let wan_bp_ips = uniq(general.wan_bp_ips || []);
-    let wan_fw_ips = uniq(general.wan_fw_ips || []);
+    /* Forwarded IP List: 每行一条 CIDR 的文件，命中的地址强制交给 Xray ——
+       与 wan_fw_ips 合并后再按 v4/v6 拆分，其余逻辑复用原有集合与规则。 */
+    const wan_fw_ip_list = filter(
+        map(split(readfile(general.wan_fw_ip_list || "") || "", /[\r\n]/), l => trim(l)),
+        l => length(l) > 0 && substr(l, 0, 1) != "#"
+    );
+    let wan_fw_ips = uniq([...(general.wan_fw_ips || []), ...wan_fw_ip_list]);
     let wan_bp_dns = dns_direct_servers(config);
     const wan_bp_ips_v4 = filter(wan_bp_ips, v => index(v, ":") == -1);
     const wan_bp_ips_v6 = filter(wan_bp_ips, v => index(v, ":") != -1);
+
+    /* Bypassed IP List: 每行一条 CIDR 的文件，命中的地址不经 Xray。
+       等价于 wan_bp_ips，但内容跟随文件更新；默认取 dnsmasq-extra 维护的
+       chnroute.txt，这样国内地址段不必写进 UCI。 */
+    const wan_bp_ip_list_file = general.wan_bp_ip_list || "/etc/dnsmasq-extra.d/chnroute.txt";
+    const wan_bp_ip_list = filter(
+        map(split(readfile(wan_bp_ip_list_file) || "", /[\r\n]/), l => trim(l)),
+        l => length(l) > 0 && substr(l, 0, 1) != "#"
+    );
+    const wan_bp_ip_list_v4 = filter(wan_bp_ip_list, v => index(v, ":") == -1);
+    const wan_bp_ip_list_v6 = filter(wan_bp_ip_list, v => index(v, ":") != -1);
     const wan_fw_ips_v4 = filter(wan_fw_ips, v => index(v, ":") == -1);
     const wan_fw_ips_v6 = filter(wan_fw_ips, v => index(v, ":") != -1);
     const wan_bp_dns_v4 = filter(wan_bp_dns, v => index(v.ip, ":") == -1);
@@ -264,6 +281,24 @@
     }
 {% endif %}
 
+{% if (length(wan_bp_ip_list_v4) > 0): %}
+    set tp_spec_dv4_ch {
+        type ipv4_addr
+        flags interval
+        auto-merge
+        elements = { {{ join(", ", wan_bp_ip_list_v4) }} }
+    }
+{% endif %}
+
+{% if (length(wan_bp_ip_list_v6) > 0): %}
+    set tp_spec_dv6_ch {
+        type ipv6_addr
+        flags interval
+        auto-merge
+        elements = { {{ join(", ", wan_bp_ip_list_v6) }} }
+    }
+{% endif %}
+
 {% if (length(wan_bp_ips_v4) > 0): %}
     set tp_spec_dv4_bp {
         type ipv4_addr
@@ -287,6 +322,7 @@
         type ipv4_addr
         size {{ length(wan_fw_ips_v4) * 2 + 1 }}
         flags interval
+        auto-merge
         elements = { {{ join(", ", wan_fw_ips_v4)}} }
     }
 {% endif %}
@@ -296,6 +332,7 @@
         type ipv6_addr
         size {{ length(wan_fw_ips_v6) * 2 + 1 }}
         flags interval
+        auto-merge
         elements = { {{ join(", ", wan_fw_ips_v6)}} }
     }
 {% endif %}
@@ -547,6 +584,12 @@
 {% endif %}
 {% if (length(wan_fw_ips_v6) > 0): %}
         ip6 daddr @tp_spec_dv6_fw {{ counter }} goto tp_spec_lan_fw
+{% endif %}
+{% if (length(wan_bp_ip_list_v4) > 0): %}
+        ip daddr @tp_spec_dv4_ch {{ counter }} accept comment "Bypassed IP List (IPv4)"
+{% endif %}
+{% if (length(wan_bp_ip_list_v6) > 0): %}
+        ip6 daddr @tp_spec_dv6_ch {{ counter }} accept comment "Bypassed IP List (IPv6)"
 {% endif %}
 {% if (ignore_tp_spec_def_gw == null): %}
         ip daddr @tp_spec_dv4_dg {{ counter }} accept

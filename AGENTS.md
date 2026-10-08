@@ -42,8 +42,15 @@ DNS 交给 dnsmasq-extra、国内直连放在 nft 层、不使用 geoip/geosite 
    - **必须开启 sniffing**（`tproxy_sniffing=1`）才有域名可用。
    - `Bypassed Domain List` 默认 `/etc/dnsmasq-extra.d/direct.gz`；
      `Forwarded Domain List` 没有默认值（UI 描述里的 `gfwlist.gz` 只是示例）。
-   - 文件每行一个域名、`#` 注释；`.gz` 先用 `zcat` 解到 `/tmp` 再读（ucode 无解压）；
+   - 文件每行一个域名、`#` 注释；读取对齐 dnsmasq-extra 的 `auto_cat`：
+     名字可带/不带 `.gz`，优先 `<name>.gz`、其次 `<name>`；配成 `.gz` 但实际只有
+     去掉 `.gz` 的明文文件时也会回退读取——所以 `/etc/dnsmasq-extra.d/direct` 和
+     `direct.gz` 都能用。`.gz` 先用 `zcat` 解到 `/tmp` 再读（ucode 无解压）；
      裸域名统一加 `domain:` 前缀（xray 的 `domain:` 即后缀匹配，含子域），去掉前导 `.`。
+   - `Bypassed Domain` 还会自动并入 dnsmasq-extra 的 `direct_domains`
+     （`/etc/config/dnsmasq-extra` 的 `list direct_domains`），同样加 `domain:` 前缀；
+     该配置/选项不存在时忽略（dnsmasq-extra 自己也把这份列表追加进 homeproxy 的
+     `direct_list.txt`，两边的"强制直连域名"保持同一份来源）。
    - 读文件的时机不同：**域名列表在 xray 启动时**由 `gen_config.uc` 读取
      （改文件后要重启 xray），**IP 列表在 fw4 重载时**由模板读取（`fw4 reload` 即可）。
 

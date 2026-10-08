@@ -1,5 +1,7 @@
 #!/bin/sh
 uci get xray_core.@general[-1] >/dev/null 2>&1 || uci add xray_core general >/dev/null 2>&1
+uci -q get xray_core.@general[-1].wan_bp_ip_list >/dev/null 2>&1 ||
+	uci -q set xray_core.@general[-1].wan_bp_ip_list='/etc/dnsmasq-extra.d/chnroute.txt'
 uci commit xray_core
 uci -q batch <<-EOF >/dev/null
 	delete ucitrack.@xray_core[-1]

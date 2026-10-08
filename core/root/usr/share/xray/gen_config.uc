@@ -1,8 +1,8 @@
 #!/usr/bin/ucode
 "use strict";
 
-import { access } from "fs";
-import { load_config } from "./common/config.mjs";
+import { readfile, unlink } from "fs";
+import { load_config, load_dnsmasq_extra_direct_domains } from "./common/config.mjs";
 import { bridge_outbounds, bridge_rules, bridges } from "./feature/bridge.mjs";
 import { dokodemo_inbound, extra_inbound_balancers, extra_inbound_global, extra_inbound_rules, extra_inbounds, http_inbound, https_inbound, socks_inbound } from "./feature/inbound.mjs";
 import { manual_tproxy_outbound_tags, manual_tproxy_outbounds, manual_tproxy_rules } from "./feature/manual_tproxy.mjs";
@@ -153,6 +153,72 @@ function rules(proxy, bridge, manual_tproxy, extra_inbound) {
     const extra_inbound_global_socks5_tags = extra_inbound_global_tags["socks5"] || [];
     const built_in_tcp_inbounds = [...tproxy_tcp_inbound_v4_tags, ...extra_inbound_global_tcp_tags, ...extra_inbound_global_http_tags, ...extra_inbound_global_socks5_tags, "socks_inbound", "https_inbound", "http_inbound"];
     const built_in_udp_inbounds = [...tproxy_udp_inbound_v4_tags, ...extra_inbound_global_udp_tags, "dns_conf_inbound"];
+    /* 域名分流（参考 homeproxy 的直连/代理域名列表）：列表可写在 UCI，也可指向
+       一个每行一个域名的文件。必须开启 Sniffing（tproxy_sniffing）才有域名可用。 */
+    /* 读列表文件，对齐 dnsmasq-extra 的 auto_cat：
+       - 名字可带或不带 .gz：优先 <name>.gz，其次 <name>
+       - 配成 .gz 但实际只有去掉 .gz 的明文文件时，回退到 <name> 读取
+       所以 .../direct 和 .../direct.gz 指向同一份逻辑列表。 */
+    const read_domain_file = function (file, key) {
+        const candidates = [];
+        if (substr(file, -3) == ".gz") {
+            push(candidates, file);
+            push(candidates, substr(file, 0, length(file) - 3));
+        } else {
+            push(candidates, file + ".gz");
+            push(candidates, file);
+        }
+        for (let cand in candidates) {
+            let raw = null;
+            if (substr(cand, -3) == ".gz") {
+                /* 上游清单（dnsmasq-extra 的 direct.gz / gfwlist.gz）是 gzip 的：
+                   ucode 无内置解压，借 shell 解到 /tmp 再读。 */
+                const tmp = "/tmp/.xray-domain-list." + key;
+                system(sprintf("zcat '%s' > %s 2>/dev/null", cand, tmp));
+                raw = readfile(tmp);
+                unlink(tmp);
+            } else {
+                raw = readfile(cand);
+            }
+            if (raw != null && length(raw) > 0)
+                return raw;
+        }
+        return null;
+    };
+    /* 文件里是裸域名，统一加 domain: 前缀（xray 的 domain: 即后缀匹配）。 */
+    const normalize_domain = v => "domain:" + ltrim(trim(v), ".");
+    const load_domain_list = function (key, file_key, file_default) {
+        let uci_list = proxy[key];
+        if (uci_list == null)
+            uci_list = [];
+        else if (type(uci_list) != "array")
+            uci_list = [uci_list];
+        let list = map(uci_list, v => trim(v));
+        const file = proxy[file_key] || file_default;
+        if (file != null && length(file) > 0) {
+            const raw = read_domain_file(file, key);
+            if (raw != null)
+                push(list, ...map(
+                    filter(
+                        map(split(raw, /[\r\n]/), v => trim(v)),
+                        v => length(v) > 0 && substr(v, 0, 1) != "#"
+                    ),
+                    normalize_domain
+                ));
+        }
+        return uniq(filter(list, v => length(v) > 0));
+    };
+    const fw_domains = load_domain_list("wan_fw_domains", "wan_fw_domain_list");
+    /* 直连列表再并入 dnsmasq-extra 的 direct_domains（与文件列表同样按后缀匹配），
+       这样在 dnsmasq-extra 里维护的强制直连域名也会直连出站。 */
+    const bp_domains = uniq([
+        ...load_domain_list("wan_bp_domains", "wan_bp_domain_list", "/etc/dnsmasq-extra.d/direct.gz"),
+        ...map(
+            filter(load_dnsmasq_extra_direct_domains(), v => length(trim(v)) > 0),
+            normalize_domain
+        )
+    ]);
+
     let result = [
         ...manual_tproxy_rules(manual_tproxy),
         ...extra_inbound_rules(extra_inbound),
@@ -180,6 +246,24 @@ function rules(proxy, bridge, manual_tproxy, extra_inbound) {
         },
     ];
     if (proxy["tproxy_sniffing"] == "1") {
+        /* 代理域名列表：优先于后续的 catch-all 出站规则 */
+        if (length(fw_domains) > 0) {
+            splice(result, 0, 0, {
+                type: "field",
+                inboundTag: [...built_in_tcp_inbounds, ...built_in_udp_inbounds, ...tproxy_tcp_inbound_v6_tags, ...tproxy_udp_inbound_v6_tags],
+                balancerTag: "tcp_outbound_v4",
+                domain: fw_domains
+            });
+        }
+        /* 直连域名列表：splice 在后 → 最终排在代理列表之前（直连优先） */
+        if (length(bp_domains) > 0) {
+            splice(result, 0, 0, {
+                type: "field",
+                inboundTag: [...built_in_tcp_inbounds, ...built_in_udp_inbounds, ...tproxy_tcp_inbound_v6_tags, ...tproxy_udp_inbound_v6_tags],
+                outboundTag: "direct",
+                domain: bp_domains
+            });
+        }
         if (proxy["direct_bittorrent"] == "1") {
             splice(result, 0, 0, {
                 type: "field",
