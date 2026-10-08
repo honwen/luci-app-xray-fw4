@@ -41,7 +41,7 @@ return view.extend({
 
         s.tab("sniffing", _("Sniffing"));
 
-        s.taboption('sniffing', form.Flag, 'tproxy_sniffing', _('Enable Sniffing'), _('Route requests according to domain settings. Deprecated.'));
+        s.taboption('sniffing', form.Flag, 'tproxy_sniffing', _('Enable Sniffing'), _('Sniff the domain (TLS SNI / HTTP Host) of proxied connections. Required by the Bypassed/Forwarded Domain List in Outbound Routing.'));
 
         let route_only = s.taboption('sniffing', form.Flag, 'route_only', _('Route Only'), _('Use sniffed domain for routing only but still access through IP. Reduces unnecessary DNS requests. See <a href="https://github.com/XTLS/Xray-core/commit/a3023e43ef55d4498b1afbc9a7fe7b385138bb1a">here</a> for help.'));
         route_only.depends("tproxy_sniffing", "1");

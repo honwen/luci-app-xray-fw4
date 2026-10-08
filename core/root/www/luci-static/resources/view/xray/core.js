@@ -400,8 +400,29 @@ return view.extend({
         o = s.taboption('outbound_routing', form.DynamicList, "wan_bp_ips", _("Bypassed IP"), _("Requests to these IPs won't be forwarded through Xray."));
         o.datatype = "ipaddr";
 
+        o = s.taboption('outbound_routing', form.Value, "wan_bp_ip_list", _("Bypassed IP List"), _("Path of a file listing one CIDR per line (for example <code>/etc/dnsmasq-extra.d/chnroute.txt</code>). Addresses in it won't be forwarded through Xray, and the list follows the file."));
+        o.placeholder = "/etc/dnsmasq-extra.d/chnroute.txt";
+        o.default = "/etc/dnsmasq-extra.d/chnroute.txt";
+
         o = s.taboption('outbound_routing', form.DynamicList, "wan_fw_ips", _("Forwarded IP"), _("Requests to these IPs will always be handled by Xray (but still might be bypassed by Xray itself, like private addresses).<br/>Useful for some really strange network. If you really need to forward private addresses, try Manual Transparent Proxy below."));
         o.datatype = "ipaddr";
+
+        o = s.taboption('outbound_routing', form.Value, "wan_fw_ip_list", _("Forwarded IP List"), _("Path of a file listing one CIDR per line. Addresses in it will always be handled by Xray, even when the Bypassed IP List would skip them; the list follows the file."));
+        o.datatype = "file";
+
+        o = s.taboption('outbound_routing', form.DynamicList, "wan_bp_domains", _("Bypassed Domain"), _("Requests to these domains won't be forwarded through Xray, even if their IPs would be. Accepts Xray rule syntax such as <code>domain:example.com</code> or <code>full:example.com</code>. Requires Sniffing."));
+        o.datatype = "string";
+
+        o = s.taboption('outbound_routing', form.Value, "wan_bp_domain_list", _("Bypassed Domain List"), _("Path of a file listing one domain per line; <code>.gz</code> files are decompressed first. For example dnsmasq-extra's <code>/etc/dnsmasq-extra.d/direct.gz</code>."));
+        o.placeholder = "/etc/dnsmasq-extra.d/direct.gz";
+        o.default = "/etc/dnsmasq-extra.d/direct.gz";
+        o.datatype = "file";
+
+        o = s.taboption('outbound_routing', form.DynamicList, "wan_fw_domains", _("Forwarded Domain"), _("Requests to these domains will always be handled by Xray. Same syntax as Bypassed Domain. Requires Sniffing."));
+        o.datatype = "string";
+
+        o = s.taboption('outbound_routing', form.Value, "wan_fw_domain_list", _("Forwarded Domain List"), _("Path of a file listing one domain per line; <code>.gz</code> files are decompressed first. For example dnsmasq-extra's <code>/etc/dnsmasq-extra.d/gfwlist.gz</code>."));
+        o.datatype = "file";
 
         o = s.taboption('outbound_routing', form.ListValue, 'transparent_default_port_policy', _('Default Ports Policy'));
         o.value("forwarded", _("Forwarded"));
