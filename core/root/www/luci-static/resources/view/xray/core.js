@@ -92,10 +92,6 @@ function access_control_format(config_data, s, t) {
 }
 
 function check_resource_files(load_result) {
-    let geoip_existence = false;
-    let geoip_size = 0;
-    let geosite_existence = false;
-    let geosite_size = 0;
     let xray_bin_default = false;
     let xray_running = false;
     for (const f of load_result) {
@@ -105,20 +101,8 @@ function check_resource_files(load_result) {
         if (f.name == "xray.pid") {
             xray_running = true;
         }
-        if (f.name == "geoip.dat") {
-            geoip_existence = true;
-            geoip_size = '%.2mB'.format(f.size);
-        }
-        if (f.name == "geosite.dat") {
-            geosite_existence = true;
-            geosite_size = '%.2mB'.format(f.size);
-        }
     }
     return {
-        geoip_existence: geoip_existence,
-        geoip_size: geoip_size,
-        geosite_existence: geosite_existence,
-        geosite_size: geosite_size,
         xray_bin_default: xray_bin_default,
         xray_running: xray_running,
     };
@@ -135,18 +119,12 @@ return view.extend({
 
     render: function (load_result) {
         const config_data = load_result[0];
-        const { geoip_existence, geoip_size, geosite_existence, geosite_size, xray_bin_default, xray_running } = check_resource_files(load_result[1]);
+        const { xray_bin_default, xray_running } = check_resource_files(load_result[1]);
         const status_text = xray_running ? _("[Xray is running]") : _("[Xray is stopped]");
         const hosts = load_result[2].hosts;
 
-        let asset_file_status = _('WARNING: at least one of asset files (geoip.dat, geosite.dat) is not found under /usr/share/xray. Xray may not work properly. See <a href="https://github.com/yichya/luci-app-xray">here</a> for help.');
-        if (geoip_existence) {
-            if (geosite_existence) {
-                asset_file_status = _('Asset files check: ') + `geoip.dat ${geoip_size}; geosite.dat ${geosite_size}. ` + _('Report issues or request for features <a href="https://github.com/yichya/luci-app-xray">here</a>.');
-            }
-        }
         const firewall_mark = uci.get_first(shared.variant, "general", "mark") || '255';
-        const m = new form.Map(shared.variant, _('Xray'), status_text + " " + asset_file_status);
+        const m = new form.Map(shared.variant, _('Xray'), status_text);
 
         let s, o, ss;
 
@@ -213,7 +191,7 @@ return view.extend({
         o.default = "UseIP";
         o.modalonly = true;
 
-        o = ss.taboption('resolving', form.Value, 'domain_resolve_dns', _('Resolve Domain via DNS'), _("Specify a DNS to resolve server hostname. Be careful of possible recursion."));
+        o = ss.taboption('resolving', form.Value, 'domain_resolve_dns', _('Resolve Domain via DNS'), _("Resolve this server's hostname with the DNS below instead of the system resolver (dnsmasq / smartdns). The query is routed directly, never through the proxy. Accepts <code>ip</code> or <code>ip:port</code>."));
         o.datatype = "or(ipaddr, ipaddrport(1))";
         o.modalonly = true;
 
@@ -225,9 +203,6 @@ return view.extend({
         o.value("https", _("DNS over HTTPS"));
         o.value("https+local", _("DNS over HTTPS (direct)"));
         o.default = "udp";
-        o.modalonly = true;
-
-        o = ss.taboption('resolving', form.DynamicList, 'domain_resolve_expect_ips', _('Expected Server IPs'), _("Filter resolved IPs by GeoIP or CIDR. Resource file <code>geoip.dat</code> is required for GeoIP filtering."));
         o.modalonly = true;
 
         ss.tab('protocol', _('Protocol Settings'));
@@ -337,17 +312,17 @@ return view.extend({
         tproxy_ifaces_v6.nocreate = true;
         tproxy_ifaces_v6.multiple = true;
 
-        let bypass_ifaces_v4 = s.taboption('lan_hosts_access_control', widgets.DeviceSelect, 'bypass_ifaces_v4', _("Devices to disable IPv4 tproxy"), _("This overrides per-device settings below. FakeDNS and manual transparent proxy won't be affected by this option."));
+        let bypass_ifaces_v4 = s.taboption('lan_hosts_access_control', widgets.DeviceSelect, 'bypass_ifaces_v4', _("Devices to disable IPv4 tproxy"), _("This overrides per-device settings below. Manual transparent proxy won't be affected by this option."));
         bypass_ifaces_v4.noaliases = true;
         bypass_ifaces_v4.nocreate = true;
         bypass_ifaces_v4.multiple = true;
 
-        let bypass_ifaces_v6 = s.taboption('lan_hosts_access_control', widgets.DeviceSelect, 'bypass_ifaces_v6', _("Devices to disable IPv6 tproxy"), _("This overrides per-device settings below. FakeDNS and manual transparent proxy won't be affected by this option."));
+        let bypass_ifaces_v6 = s.taboption('lan_hosts_access_control', widgets.DeviceSelect, 'bypass_ifaces_v6', _("Devices to disable IPv6 tproxy"), _("This overrides per-device settings below. Manual transparent proxy won't be affected by this option."));
         bypass_ifaces_v6.noaliases = true;
         bypass_ifaces_v6.nocreate = true;
         bypass_ifaces_v6.multiple = true;
 
-        let lan_hosts = s.taboption('lan_hosts_access_control', form.SectionValue, "lan_hosts_section", form.GridSection, 'lan_hosts', _('LAN Hosts Access Control'), _("Per-device settings here override per-interface enabling settings above. FakeDNS and manual transparent proxy won't be affected by these options.")).subsection;
+        let lan_hosts = s.taboption('lan_hosts_access_control', form.SectionValue, "lan_hosts_section", form.GridSection, 'lan_hosts', _('LAN Hosts Access Control'), _("Per-device settings here override per-interface enabling settings above. Manual transparent proxy won't be affected by these options.")).subsection;
         lan_hosts.sortable = false;
         lan_hosts.anonymous = true;
         lan_hosts.addremove = true;
@@ -419,129 +394,8 @@ return view.extend({
             }
         }
 
-        s.tab('dns', _('DNS'));
-
-        o = s.taboption('dns', form.Value, 'fast_dns', _('Fast DNS'), _("DNS for resolving outbound domains and following bypassed domains"));
-        o.datatype = 'or(ip4addr, ip4addrport)';
-        o.placeholder = "223.5.5.5:53";
-
-        if (geosite_existence) {
-            o = s.taboption('dns', form.DynamicList, "bypassed_domain_rules", _('Bypassed domain rules'), _('Specify rules like <code>geosite:cn</code> or <code>domain:bilibili.com</code>. See <a href="https://xtls.github.io/config/dns.html#dnsobject">documentation</a> for details.'));
-        } else {
-            o = s.taboption('dns', form.DynamicList, 'bypassed_domain_rules', _('Bypassed domain rules'), _('Specify rules like <code>domain:bilibili.com</code> or see <a href="https://xtls.github.io/config/dns.html#dnsobject">documentation</a> for details.<br/> In order to use Geosite rules you need a valid resource file /usr/share/xray/geosite.dat.<br/>Compile your firmware again with data files to use Geosite rules, or <a href="https://github.com/v2fly/domain-list-community">download one</a> and upload it to your router.'));
-        }
-
-        o = s.taboption('dns', form.Value, 'secure_dns', _('Secure DNS'), _("DNS for resolving known polluted domains (specify forwarded domain rules here)"));
-        o.datatype = 'or(ip4addr, ip4addrport)';
-        o.placeholder = "8.8.8.8:53";
-
-        if (geosite_existence) {
-            o = s.taboption('dns', form.DynamicList, "forwarded_domain_rules", _('Forwarded domain rules'), _('Specify rules like <code>geosite:geolocation-!cn</code> or <code>domain:youtube.com</code>. See <a href="https://xtls.github.io/config/dns.html#dnsobject">documentation</a> for details.'));
-        } else {
-            o = s.taboption('dns', form.DynamicList, 'forwarded_domain_rules', _('Forwarded domain rules'), _('Specify rules like <code>domain:youtube.com</code> or see <a href="https://xtls.github.io/config/dns.html#dnsobject">documentation</a> for details.<br/> In order to use Geosite rules you need a valid resource file /usr/share/xray/geosite.dat.<br/>Compile your firmware again with data files to use Geosite rules, or <a href="https://github.com/v2fly/domain-list-community">download one</a> and upload it to your router.'));
-        }
-
-        o = s.taboption('dns', form.Value, 'default_dns', _('Default DNS'), _("DNS for resolving other sites (not in the rules above) and DNS records other than A or AAAA (TXT and MX for example)"));
-        o.datatype = 'or(ip4addr, ip4addrport)';
-        o.placeholder = "1.1.1.1:53";
-
-        if (geosite_existence) {
-            o = s.taboption('dns', form.DynamicList, "blocked_domain_rules", _('Blocked domain rules'), _('Specify rules like <code>geosite:category-ads</code> or <code>domain:baidu.com</code>. See <a href="https://xtls.github.io/config/dns.html#dnsobject">documentation</a> for details.'));
-        } else {
-            o = s.taboption('dns', form.DynamicList, 'blocked_domain_rules', _('Blocked domain rules'), _('Specify rules like <code>domain:baidu.com</code> or see <a href="https://xtls.github.io/config/dns.html#dnsobject">documentation</a> for details.<br/> In order to use Geosite rules you need a valid resource file /usr/share/xray/geosite.dat.<br/>Compile your firmware again with data files to use Geosite rules, or <a href="https://github.com/v2fly/domain-list-community">download one</a> and upload it to your router.'));
-        }
-
-        o = s.taboption('dns', form.Flag, 'blocked_to_loopback', _('Blocked to loopback'), _('Return <code>127.127.127.127</code> as response for blocked domain rules. If not selected, <code>NXDOMAIN</code> will be returned.'));
-        o.modalonly = true;
-
-        o = s.taboption('dns', form.Value, 'dns_port', _('Xray DNS Server Port'), _("Do not use port 53 (dnsmasq), port 5353 (mDNS) or other common ports"));
-        o.datatype = 'port';
-        o.placeholder = 5300;
-
-        o = s.taboption('dns', form.Value, 'dns_count', _('Extra DNS Server Ports'), _('Listen for DNS Requests on multiple ports (all of which serves as dnsmasq upstream servers).<br/>For example if Xray DNS Server Port is 5300 and use 3 extra ports, 5300 - 5303 will be used for DNS requests.<br/>Increasing this value may help reduce the possibility of temporary DNS lookup failures.'));
-        o.datatype = 'range(0, 50)';
-        o.placeholder = 3;
-
-        s.tab('fake_dns', _('FakeDNS'));
-
-        let tproxy_port_tcp_f4 = s.taboption('fake_dns', form.Value, 'tproxy_port_tcp_f4', _('Transparent proxy port (TCP4)'));
-        tproxy_port_tcp_f4.datatype = 'port';
-        tproxy_port_tcp_f4.placeholder = 1086;
-
-        let tproxy_port_tcp_f6 = s.taboption('fake_dns', form.Value, 'tproxy_port_tcp_f6', _('Transparent proxy port (TCP6)'));
-        tproxy_port_tcp_f6.datatype = 'port';
-        tproxy_port_tcp_f6.placeholder = 1087;
-
-        let tproxy_port_udp_f4 = s.taboption('fake_dns', form.Value, 'tproxy_port_udp_f4', _('Transparent proxy port (UDP4)'));
-        tproxy_port_udp_f4.datatype = 'port';
-        tproxy_port_udp_f4.placeholder = 1088;
-
-        let tproxy_port_udp_f6 = s.taboption('fake_dns', form.Value, 'tproxy_port_udp_f6', _('Transparent proxy port (UDP6)'));
-        tproxy_port_udp_f6.datatype = 'port';
-        tproxy_port_udp_f6.placeholder = 1089;
-
-        let pool_v4 = s.taboption('fake_dns', form.Value, 'pool_v4', _('Address Pool (IPv4)'));
-        pool_v4.datatype = 'ip4addr';
-        pool_v4.placeholder = "198.18.0.0/15";
-
-        let pool_v4_size = s.taboption('fake_dns', form.Value, 'pool_v4_size', _('Address Pool Size (IPv4)'));
-        pool_v4_size.datatype = 'integer';
-        pool_v4_size.placeholder = 65535;
-
-        let pool_v6 = s.taboption('fake_dns', form.Value, 'pool_v6', _('Address Pool (IPv6)'));
-        pool_v6.datatype = 'ip6addr';
-        pool_v6.placeholder = "2001:2::/48";
-
-        let pool_v6_size = s.taboption('fake_dns', form.Value, 'pool_v6_size', _('Address Pool Size (IPv6)'));
-        pool_v6_size.datatype = 'integer';
-        pool_v6_size.placeholder = 65535;
-
-        let fs = s.taboption('fake_dns', form.SectionValue, "fake_dns_section", form.GridSection, 'fakedns', _('FakeDNS Routing'), _('See <a href="https://github.com/v2ray/v2ray-core/issues/2233">FakeDNS</a> for details.')).subsection;
-        fs.sortable = false;
-        fs.anonymous = true;
-        fs.addremove = true;
-
-        let fake_dns_domain_names = fs.option(form.DynamicList, "fake_dns_domain_names", _("Domain names"));
-        fake_dns_domain_names.rmempty = false;
-        fake_dns_domain_names.textvalue = list_folded_format(config_data, "fake_dns_domain_names", "domains", 20);
-
-        let fake_dns_forward_server_tcp = fs.option(form.MultiValue, 'fake_dns_forward_server_tcp', _('Force Forward server (TCP)'));
-        fake_dns_forward_server_tcp.datatype = "uciname";
-        fake_dns_forward_server_tcp.textvalue = destination_format(config_data, "fake_dns_forward_server_tcp", null, 40);
-
-        let fake_dns_forward_server_udp = fs.option(form.MultiValue, 'fake_dns_forward_server_udp', _('Force Forward server (UDP)'));
-        fake_dns_forward_server_udp.datatype = "uciname";
-        fake_dns_forward_server_udp.textvalue = destination_format(config_data, "fake_dns_forward_server_udp", null, 40);
-
-        let fake_dns_balancer_strategy = fs.option(form.Value, 'fake_dns_balancer_strategy', _('Balancer Strategy'), _('Strategy <code>leastPing</code> requires observatory (see "Extra Options" tab) to be enabled.'));
-        fake_dns_balancer_strategy.value("random");
-        fake_dns_balancer_strategy.value("leastPing");
-        fake_dns_balancer_strategy.value("roundRobin");
-        fake_dns_balancer_strategy.default = "random";
-        fake_dns_balancer_strategy.rmempty = false;
-        fake_dns_balancer_strategy.modalonly = true;
-
         s.tab('outbound_routing', _('Outbound Routing'));
 
-        if (geoip_existence) {
-            let geoip_direct_code_list = s.taboption('outbound_routing', form.DynamicList, 'geoip_direct_code_list', _('GeoIP Direct Code List (IPv4)'), _("Hosts in these GeoIP sets will not be forwarded through Xray. Remove all items to forward all non-private hosts."));
-            geoip_direct_code_list.datatype = "string";
-            geoip_direct_code_list.value("cn", "cn");
-            geoip_direct_code_list.value("telegram", "telegram");
-
-            let geoip_direct_code_list_v6 = s.taboption('outbound_routing', form.DynamicList, 'geoip_direct_code_list_v6', _('GeoIP Direct Code List (IPv6)'), _("Hosts in these GeoIP sets will not be forwarded through Xray. Remove all items to forward all non-private hosts."));
-            geoip_direct_code_list_v6.datatype = "string";
-            geoip_direct_code_list_v6.value("cn", "cn");
-            geoip_direct_code_list_v6.value("telegram", "telegram");
-        } else {
-            let geoip_direct_code_list = s.taboption('outbound_routing', form.DynamicList, 'geoip_direct_code_list', _('GeoIP Direct Code List (IPv4)'), _("Resource file /usr/share/xray/geoip.dat not exist. All network traffic will be forwarded. <br/> Compile your firmware again with data files to use this feature, or<br/><a href=\"https://github.com/v2fly/geoip\">download one</a> (maybe disable transparent proxy first) and upload it to your router."));
-            geoip_direct_code_list.readonly = true;
-            geoip_direct_code_list.datatype = "string";
-
-            let geoip_direct_code_list_v6 = s.taboption('outbound_routing', form.DynamicList, 'geoip_direct_code_list_v6', _('GeoIP Direct Code List (IPv6)'), _("Resource file /usr/share/xray/geoip.dat not exist. All network traffic will be forwarded. <br/> Compile your firmware again with data files to use this feature, or<br/><a href=\"https://github.com/v2fly/geoip\">download one</a> (maybe disable transparent proxy first) and upload it to your router."));
-            geoip_direct_code_list_v6.readonly = true;
-            geoip_direct_code_list_v6.datatype = "string";
-        }
 
         o = s.taboption('outbound_routing', form.DynamicList, "wan_bp_ips", _("Bypassed IP"), _("Requests to these IPs won't be forwarded through Xray."));
         o.datatype = "ipaddr";
@@ -570,7 +424,7 @@ return view.extend({
         o.depends("transparent_default_port_policy", "forwarded");
         o.datatype = "portrange";
 
-        o = s.taboption('outbound_routing', form.SectionValue, "access_control_manual_tproxy", form.GridSection, 'manual_tproxy', _('Manual Transparent Proxy'), _('Compared to iptables REDIRECT, Xray could do NAT46 / NAT64 (for example accessing IPv6 only sites). See <a href="https://github.com/v2ray/v2ray-core/issues/2233">FakeDNS</a> for details.'));
+        o = s.taboption('outbound_routing', form.SectionValue, "access_control_manual_tproxy", form.GridSection, 'manual_tproxy', _('Manual Transparent Proxy'), _('Compared to iptables REDIRECT, Xray could do NAT46 / NAT64 (for example accessing IPv6 only sites).'));
 
         ss = o.subsection;
         ss.sortable = false;
@@ -578,7 +432,7 @@ return view.extend({
         ss.addremove = true;
         ss.nodescriptions = true;
 
-        o = ss.option(form.Value, "source_addr", _("Source Address"), _("Fill an IP address or a rule like <code>geoip:cn</code> or <code>ext:/geoip/cloudflare.dat:cloudflare</code>."));
+        o = ss.option(form.Value, "source_addr", _("Source Address"), _("Fill an IP address or a rule like <code>ext:/geoip/cloudflare.dat:cloudflare</code>."));
         o.validate = shared.validate_ip_or_geoip;
         o.rmempty = false;
 
@@ -677,7 +531,6 @@ return view.extend({
 
         o = s.taboption('extra_options', form.Flag, 'access_log', _('Enable Access Log'), _('Access log will also be written to System Log.'));
 
-        o = s.taboption('extra_options', form.Flag, 'dns_log', _('Enable DNS Log'), _('DNS log will also be written to System Log.'));
 
         o = s.taboption('extra_options', form.Flag, 'xray_api', _('Enable Xray API Service'), _('Xray API Service uses port 8080 and GRPC protocol. Also callable via <code>xray api</code> or <code>ubus call xray</code>. See <a href="https://xtls.github.io/document/command.html#xray-api">here</a> for help.'));
 
@@ -740,7 +593,7 @@ return view.extend({
         custom_configuration_hook.rows = 20;
 
         const servers = uci.sections(config_data, "servers");
-        for (let selection of [destination, fake_dns_forward_server_tcp, fake_dns_forward_server_udp, tcp_balancer_v4, tcp_balancer_v6, udp_balancer_v4, udp_balancer_v6, bridge_upstream, force_forward_server_tcp, force_forward_server_udp, dialer_proxy]) {
+        for (let selection of [destination, tcp_balancer_v4, tcp_balancer_v6, udp_balancer_v4, udp_balancer_v6, bridge_upstream, force_forward_server_tcp, force_forward_server_udp, dialer_proxy]) {
             if (servers.length == 0) {
                 selection.value("direct", _("No server configured"));
                 selection.readonly = true;

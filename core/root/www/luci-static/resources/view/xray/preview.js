@@ -16,31 +16,6 @@ return view.extend({
         s.addremove = false;
         s.anonymous = true;
 
-        s.tab("dns_hijack", _("DNS Hijacking"));
-        s.taboption('dns_hijack', form.Flag, 'align_fast_dns_to_geoip_direct', _('Align Fast DNS & GeoIP Direct'), _("Return only IP addresses from GeoIP Direct List for Fast DNS."));
-
-        let dnsmasq_integration_mode = s.taboption('dns_hijack', form.ListValue, 'dnsmasq_integration_mode', _('Dnsmasq Integration Mode'), _('Per Instance mode requires OpenWrt 24.10 or later versions.'));
-        dnsmasq_integration_mode.value("global", _("Global"));
-        dnsmasq_integration_mode.value("per_instance", _("Per Instance"));
-        dnsmasq_integration_mode.default = "global";
-
-        let dnsmasq_instances = s.taboption('dns_hijack', form.MultiValue, 'dnsmasq_instances', _('Integrated Instances'), _('Select none to disable dnsmasq integration. This could also be used to avoid conflicts with other DNS services, for example<br/>AdGuard Home. Some features like manual transparent proxy with associated domain names still need dnsmasq integration.'));
-        dnsmasq_instances.depends("dnsmasq_integration_mode", "per_instance");
-        for (let i of uci.sections("dhcp", "dnsmasq")) {
-            dnsmasq_instances.value(i[".name"], function () {
-                if (i[".anonymous"]) {
-                    return _("Default instance");
-                }
-                return `${_("Instance")} "${i[".name"]}"`;
-            }());
-        }
-
-        let dns_tcp_hijack = s.taboption('dns_hijack', form.Value, 'dns_tcp_hijack', _('Hijack TCP DNS Requests'), _("Redirect all outgoing TCP requests with destination port 53 to the address specified. In most cases not necessary."));
-        dns_tcp_hijack.datatype = 'ip4addrport';
-
-        let dns_udp_hijack = s.taboption('dns_hijack', form.Value, 'dns_udp_hijack', _('Hijack UDP DNS Requests'), _("Redirect all outgoing UDP requests with destination port 53 to the address specified. Recommended to use <code>127.0.0.1:53</code>."));
-        dns_udp_hijack.datatype = 'ip4addrport';
-
         s.tab("firewall", _("Extra Firewall Options"));
 
         let mark = s.taboption('firewall', form.Value, 'mark', _('Socket Mark Number'), _('Avoid proxy loopback problems with local (gateway) traffic'));
@@ -63,12 +38,10 @@ return view.extend({
         let ttl_override_bypass_ports = s.taboption('firewall', form.DynamicList, 'ttl_override_bypass_ports', _('Ports to bypass TTL override'), _("Do not override TTL for packets with these destination TCP / UDP ports."));
         ttl_override_bypass_ports.datatype = 'port';
 
-        s.taboption('firewall', form.Flag, 'fakedns_ping_response_prerouting', _('FakeDNS Ping (LAN)'), _('Respond to ICMP echo requests from LAN clients for FakeDNS address pools.'));
-        s.taboption('firewall', form.Flag, 'fakedns_ping_response_output', _('FakeDNS Ping (Local)'), _('Respond to ICMP echo requests from this router for FakeDNS address pools.'));
 
         s.tab("sniffing", _("Sniffing"));
 
-        s.taboption('sniffing', form.Flag, 'tproxy_sniffing', _('Enable Sniffing'), _('Route requests according to domain settings in "DNS Settings" tab in core settings. Deprecated; use FakeDNS instead.'));
+        s.taboption('sniffing', form.Flag, 'tproxy_sniffing', _('Enable Sniffing'), _('Route requests according to domain settings. Deprecated.'));
 
         let route_only = s.taboption('sniffing', form.Flag, 'route_only', _('Route Only'), _('Use sniffed domain for routing only but still access through IP. Reduces unnecessary DNS requests. See <a href="https://github.com/XTLS/Xray-core/commit/a3023e43ef55d4498b1afbc9a7fe7b385138bb1a">here</a> for help.'));
         route_only.depends("tproxy_sniffing", "1");

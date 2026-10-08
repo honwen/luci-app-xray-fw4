@@ -57,8 +57,7 @@ export function policy(proxy) {
 export function logging(proxy) {
     return {
         access: proxy["access_log"] == "1" ? "" : "none",
-        loglevel: proxy["loglevel"] || "warning",
-        dnsLog: proxy["dns_log"] == "1"
+        loglevel: proxy["loglevel"] || "warning"
     };
 };
 

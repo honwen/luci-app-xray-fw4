@@ -22,9 +22,11 @@ export function fallbacks(proxy, config) {
 };
 
 export function tls_outbound_settings(server, protocol) {
+    /* 不生成 allowInsecure：xray 26.x 已移除该特性，字段为 true 时直接拒绝启动
+       ("The feature allowInsecure has been removed and migrated to pinnedPeerCertSha256")，
+       为 false 才被接受。TLS 节点的证书必须有效；reality 节点不受影响（走 realitySettings）。 */
     let result = {
         serverName: server[protocol + "_tls_host"],
-        allowInsecure: server[protocol + "_tls_insecure"] != "0",
         fingerprint: server[protocol + "_tls_fingerprint"] || ""
     };
 

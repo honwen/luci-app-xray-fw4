@@ -100,42 +100,15 @@ gen_config_file() {
     [ ! "${#custom_config}" == "0" ] && echo ${custom_config} > /var/etc/xray/config_custom.json
 }
 
-setup_dnsmasq_instance() {
-    local instance_dir="/tmp/dnsmasq.${1:+"${1}."}d"
-    mkdir -p ${instance_dir}
-    utpl /usr/share/xray/dnsmasq_include.ut > ${instance_dir}/xray.conf
-    logger -st xray[$$] -p4 $(cat ${instance_dir}/xray.conf)
-}
-
-setup_dnsmasq() {
-    if [ "$(uci_get_by_type general dnsmasq_integration_mode)" == "per_instance" ]; then
-        for instance in $(uci_get_by_type general dnsmasq_instances); do
-            setup_dnsmasq_instance ${instance}
-        done
-    else
-        config_load dhcp
-        setup_dnsmasq_instance
-        config_foreach setup_dnsmasq_instance dnsmasq
-    fi
-    /etc/init.d/dnsmasq restart > /dev/null 2>&1
-}
-
-flush_dnsmasq() {
-    rm -f /tmp/dnsmasq.d/xray.conf /tmp/dnsmasq.*.d/xray.conf
-    /etc/init.d/dnsmasq restart > /dev/null 2>&1
-}
-
 create_when_enable() {
     [ "$(uci_get_by_type general transparent_proxy_enable)" == "1" ] || return 0
-    logger -st xray[$$] -p4 "Setting dnsmasq and firewall for transparent proxy..."
-    setup_dnsmasq
+    logger -st xray[$$] -p4 "Setting firewall for transparent proxy..."
     setup_firewall
     logger -st xray[$$] -p4 $(ucode /usr/share/xray/default_gateway.uc)
 }
 
 flush_when_disable() {
-    logger -st xray[$$] -p4 "Resetting dnsmasq and firewall configurations..."
-    flush_dnsmasq
+    logger -st xray[$$] -p4 "Resetting firewall configuration..."
     flush_firewall
 }
 

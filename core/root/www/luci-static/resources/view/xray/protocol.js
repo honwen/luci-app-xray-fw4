@@ -119,11 +119,6 @@ function add_flow_and_stream_security_conf(s, tab_name, depends_field_name, prot
         o.depends(`${protocol_name}_tls`, "tls");
         o.modalonly = true;
 
-        o = s.taboption(tab_name, form.Flag, `${protocol_name}_tls_insecure`, _(`[${protocol_name}][tls] Allow Insecure`));
-        o.depends(`${protocol_name}_tls`, "tls");
-        o.rmempty = false;
-        o.modalonly = true;
-
         o = s.taboption(tab_name, form.Value, `${protocol_name}_tls_fingerprint`, _(`[${protocol_name}][tls] Fingerprint`));
         o.depends(`${protocol_name}_tls`, "tls");
         o.value("", "(not set)");
