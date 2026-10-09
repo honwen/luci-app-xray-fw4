@@ -5,6 +5,20 @@ STOP=15
 USE_PROCD=1
 NAME=xray_core
 
+# 健康检查（参考 fw3 的 healthcheck）：cron 每分钟跑一次 `/etc/init.d/xray_core healthcheck`，
+# 检查进程/nft 规则/代理链路，代理坏了而裸网正常时重启自己。日志写 $HEALTHCHECK_LOG，
+# 每 3 小时清一次（两条 cron 都带 xray_healthcheck 字样，删除时按它过滤）。
+EXTRA_COMMANDS="healthcheck"
+EXTRA_HELP="	healthcheck	Check whether the service works and restart it if not"
+HEALTHCHECK_LOG=/var/log/xray_healthcheck.log
+HEALTHCHECK_STATE=/tmp/.xray_healthcheck.state
+HEALTHCHECK_HEARTBEAT=3600
+HEALTHCHECK_GRACE=30
+HEALTHCHECK_STARTED=/var/run/xray.started
+HEALTHCHECK_CRON=/etc/crontabs/root
+HEALTHCHECK_ENDPOINT=one.one.one.one
+HEALTHCHECK_RAW=119.29.29.98
+
 setup_firewall() {
     ip rule add fwmark 251 lookup 251
     ip route add local default dev lo table 251
@@ -120,15 +134,166 @@ start_service() {
     gen_config_file
     start_xray ${xray_bin}
     create_when_enable || flush_when_disable
+    date +%s > $HEALTHCHECK_STARTED 2>/dev/null
+    healthcheck_cron_add
+}
+
+# 停止前把 xray 的 per-outbound 计数累加进 /var/run/xray/metrics.json：
+# xray 的 stats 只在内存里，healthcheck 自愈重启 / 手动 restart 都会清零，
+# 归档后 Nodes 标签页显示的累计值就不会因重启而丢。
+metrics_archive() {
+    [ "$(uci_get_by_type general stats)" = "1" ] || return 0
+    [ "$(uci_get_by_type general xray_api)" = "1" ] || return 0
+    [ -x /usr/share/xray/metrics.uc ] || return 0
+    mkdir -p /var/run/xray
+    /usr/bin/ucode /usr/share/xray/metrics.uc 2>/dev/null
 }
 
 stop_service() {
+    metrics_archive
     flush_when_disable
+    healthcheck_cron_del
 }
 
 reload_service() {
     stop
     start
+}
+
+# 开机延迟启动（参考 fw3 的 general.startup_delay，默认 5s）：等 WAN/DNS 就绪再起，
+# 避免节点域名解析先于网络。只在 boot 路径生效，手动 start/restart/reload 立即启动；
+# 用分离的子 shell 做 sleep，不阻塞 boot 流程（procd 会在 sleep 结束后正常注册实例）。
+boot() {
+    local delay
+    delay=$(uci_get_by_type general startup_delay 5)
+    if [ -n "$delay" ] && [ "$delay" -ge 1 ] 2>/dev/null; then
+        logger -st xray[$$] -p4 "Delaying start by ${delay}s (startup_delay)..."
+        { sleep "$delay"; /etc/init.d/$NAME start; } >/dev/null 2>&1 </dev/null &
+    else
+        start "$@"
+    fi
+}
+
+hc_log() {
+    # 不带 -s：cron 那条把 stdout/stderr 重定向进了日志文件，logger 再吐一次 stderr 会写重复行
+    logger -t "xray[$$]" -p5 "healthcheck: $*"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> $HEALTHCHECK_LOG 2>/dev/null
+}
+
+# 只在状态变化或心跳超时时记录：健康时每分钟一条太吵（fw3 那套就是每分钟一条 + 3 小时清一次），
+# 现在健康最多每小时一条，问题/重启每次都记，恢复时因为状态从 problem 变 ok 也会立刻记一条。
+hc_log_state() {
+    local status="$1"
+    shift
+    local last_status="" last_time=0 now=$(date +%s)
+    if [ -f "$HEALTHCHECK_STATE" ]; then
+        last_status=$(sed -n 1p $HEALTHCHECK_STATE 2>/dev/null)
+        last_time=$(sed -n 2p $HEALTHCHECK_STATE 2>/dev/null)
+    fi
+    case "$last_time" in ''|*[!0-9]*) last_time=0;; esac
+
+    if [ "$status" = "ok" ] && [ "$last_status" = "ok" ] &&
+       [ $((now - last_time)) -lt $HEALTHCHECK_HEARTBEAT ]; then
+        return 0
+    fi
+    hc_log "$@"
+    printf '%s\n%s\n' "$status" "$now" > $HEALTHCHECK_STATE 2>/dev/null
+}
+
+hc_restart() {
+    hc_log_state problem "$1 - restarting $NAME..."
+    /etc/init.d/$NAME restart >/dev/null 2>&1
+}
+
+hc_try() {  # hc_try <retries> <curl args...>
+    local retries="$1"
+    shift
+    while [ "$retries" -gt 0 ]; do
+        curl -s -o /dev/null "$@" && return 0
+        retries=$((retries - 1))
+        [ "$retries" -gt 0 ] && sleep 1
+    done
+    return 1
+}
+
+# 普通 HTTP 探测（不带代理）：照 fw3 的做法优先 wait4x（自带 -i300ms 间隔重试），
+# 没有就退回 curl（不用 fw3 那层的 wait-for）。走 socks 的代理探测不能用它 ——
+# wait4x 没有 socks 支持。
+hc_check_http() {  # hc_check_http <url>
+    local url="$1"
+    if command -v wait4x >/dev/null 2>&1; then
+        wait4x http -i300ms -t5s "$url" >/dev/null 2>&1
+    else
+        hc_try 3 --connect-timeout 5 --max-time 10 "$url"
+    fi
+}
+
+hc_del_cron_entries() {
+    [ -f "$HEALTHCHECK_CRON" ] && sed -i '/xray_healthcheck/d' $HEALTHCHECK_CRON
+}
+
+healthcheck_cron_add() {
+    [ -f "$HEALTHCHECK_CRON" ] || return 0
+    [ "$(uci_get_by_type general healthcheck_enable 1)" = "1" ] || return 0
+
+    local minutes=$(( $(uci_get_by_type general healthcheck_interval 60) / 60 ))
+    [ "$minutes" -lt 1 ] 2>/dev/null && minutes=1
+
+    hc_del_cron_entries
+    echo "0 3 * * * rm -f $HEALTHCHECK_LOG" >> $HEALTHCHECK_CRON
+    echo "*/$minutes * * * * /etc/init.d/$NAME healthcheck >> $HEALTHCHECK_LOG 2>&1" >> $HEALTHCHECK_CRON
+    /etc/init.d/cron restart >/dev/null 2>&1
+}
+
+healthcheck_cron_del() {
+    hc_del_cron_entries
+    /etc/init.d/cron restart >/dev/null 2>&1
+}
+
+# 每分钟（可配）由 cron 调用：进程/nft 规则在不在 → 代理链路通不通（走本机 socks 入站，
+# 域名由节点解析，所以本机 DNS 挂了也能测）→ 代理不通时用直连国内 IP 判断是"代理坏"还是
+# "网断"；代理坏而裸网正常才重启。裸网正常但本机 DNS 解析不了探测域名 → 连 dnsmasq-extra 一起重启。
+healthcheck() {
+    command -v "$(uci_get_by_type general xray_bin)" >/dev/null 2>&1 || return 1
+    [ "$(uci_get_by_type general transparent_proxy_enable)" = "1" ] || return 1
+    [ "$(uci_get_by_type general healthcheck_enable 1)" = "1" ] || return 0
+
+    # 刚启动的宽限期：leastPing 要等 observatory 出数据，这几秒代理本来就不通，
+    # 不设宽限会在刷机/重启后误判"代理坏"并白重启一次 xray（实测踩到过）
+    local started=0 now=$(date +%s)
+    [ -f "$HEALTHCHECK_STARTED" ] && started=$(cat $HEALTHCHECK_STARTED 2>/dev/null)
+    case "$started" in ''|*[!0-9]*) started=0;; esac
+    [ $((now - started)) -lt $HEALTHCHECK_GRACE ] && return 0
+
+    pgrep -f "/usr/bin/xray run" >/dev/null 2>&1 || {
+        hc_restart "xray is not running"
+        return 0
+    }
+    nft list chain inet fw4 tp_spec_lan_ac >/dev/null 2>&1 || {
+        hc_restart "nftables rules are missing"
+        return 0
+    }
+
+    local socks_port=$(uci_get_by_type general socks_port 1080)
+    if hc_try 3 --connect-timeout 5 --max-time 10 -x "socks5h://127.0.0.1:${socks_port}" "https://${HEALTHCHECK_ENDPOINT}/cdn-cgi/trace"; then
+        hc_log_state ok "No Problem."
+        return 0
+    fi
+
+    # 走代理不通：直连国内 HTTPDNS 的 IP（不需要本机 DNS），区分代理故障和断网
+    if ! hc_check_http "http://${HEALTHCHECK_RAW}/d"; then
+        hc_log_state problem "Network Problem. Do nothing."
+        return 0
+    fi
+
+    if nslookup "$HEALTHCHECK_ENDPOINT" 127.0.0.1 >/dev/null 2>&1; then
+        hc_restart "proxy is not working (DNS is fine)"
+    else
+        hc_log_state problem "local DNS is broken - restarting dnsmasq-extra + $NAME..."
+        [ -x /etc/init.d/dnsmasq-extra ] && /etc/init.d/dnsmasq-extra restart >/dev/null 2>&1
+        /etc/init.d/$NAME restart >/dev/null 2>&1
+    fi
+    return 0
 }
 
 service_triggers() {

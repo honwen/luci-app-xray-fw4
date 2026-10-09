@@ -3,3 +3,5 @@ config general
 	list tproxy_ifaces_v6 'br-lan'
 	option transparent_proxy_enable '1'
 	option xray_bin '/usr/bin/xray'
+	option startup_delay '5'
+	option healthcheck_enable '1'

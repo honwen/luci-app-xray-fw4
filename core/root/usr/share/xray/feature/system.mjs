@@ -15,7 +15,9 @@ export function api_conf(proxy) {
             services: [
                 "HandlerService",
                 "LoggerService",
-                "StatsService"
+                "StatsService",
+                /* 让 `xray api bi`（读 balancer 各成员的 ping，Nodes 标签页用）能用 */
+                "RoutingService"
             ]
         };
     }
