@@ -4,7 +4,30 @@
         "read": {
             "uci": [
                 "xray_core"
-            ]
+            ],
+            "cgi-io": [
+                "exec"
+            ],
+            "file": {
+                "/usr/libexec/syslog-wrapper": [
+                    "exec"
+                ],
+                "/var/log/xray_healthcheck.log": [
+                    "read"
+                ],
+                "/usr/bin/xray": [
+                    "exec"
+                ],
+                "/var/run/xray/metrics.json": [
+                    "read"
+                ]
+            },
+            "ubus": {
+                "file": [
+                    "read",
+                    "stat"
+                ]
+            }
         },
         "write": {
             "uci": [

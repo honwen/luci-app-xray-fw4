@@ -83,6 +83,83 @@ DNS 交给 dnsmasq-extra、国内直连放在 nft 层、不使用 geoip/geosite 
    https**：1s 一探时 https 每次都多一次 TLS 握手，http 省掉这部分开销），
    `subjectSelector` 仍是上游那套（四个 balancer 前缀 + extra_inbound + direct + manual_tproxy）。
 
+9. **开机延迟启动 `startup_delay`（默认 5s，0 = 不延迟）**：参考 fw3（`honwen/luci-app-xray-fw3`
+   的 `general.startup_delay`，UI 同样给 0/3/5/10/15/25/40）。只作用于 **boot 路径**：
+   `xray_core` 的 `boot()` 用分离子 shell `{ sleep $delay; /etc/init.d/xray_core start; } &`
+   延迟启动，**不阻塞 boot 流程**（procd 会在 sleep 结束后正常注册实例，实测可行）；
+   手动 `start` / `restart` / `reload`（含 hotplug、LuCI 保存后的重启）**不受影响**，立即启动。
+   目的：等 WAN/DNS 就绪，避免 xray 比网络先起来导致节点域名解析失败。
+   选项缺失时按 5s 处理（设备上的老配置不会有这个选项），包内默认配置里也写成 `'5'`。
+
+10. **健康检查（`general.healthcheck_enable`，默认开，间隔 `healthcheck_interval` 默认 60s）**：
+    参考 fw3 的 healthcheck（那边是 cron + `one.one.one.one/cdn-cgi/trace` + DNSPod HTTPDNS
+    的"代理坏 vs 网断"判别），按本分支架构改写：
+    - **cron 驱动**（照 fw3）：`healthcheck_cron_add()` 在 `start_service` 里写两条
+      `/etc/crontabs/root` 条目 —— `0 */3 * * * rm -f /var/log/xray_healthcheck.log` 和
+      `*/N * * * * /etc/init.d/xray_core healthcheck >> <log>`；`stop_service` 里删掉
+      （两条都带 `xray_healthcheck` 字样，`sed -i '/xray_healthcheck/d'` 过滤）。改开关/间隔
+      保存后重载即生效（app 的 reload 是 stop+start）。
+    - 检查项：① `pgrep -f "/usr/bin/xray run"`；② `nft list chain inet fw4 tp_spec_lan_ac`
+      （iptables 时代的规则检查换成 nft 链存在性）；③ 代理链路 ——
+      `curl -x socks5h://127.0.0.1:<socks_port> https://one.one.one.one/cdn-cgi/trace`
+      重试 3 次（走本机 socks 入站，域名由**节点**解析，所以本机 DNS 挂了也能测；fw3 那套
+      iptables REDIRECT + watchdog IP 白名单在 nft 下不需要）；④ 失败时直连
+      `http://119.29.29.98/d`（DNSPod HTTPDNS 的 IP，不需要本机 DNS）判断裸网通不通 ——
+      这一步优先用 **wait4x**（`wait4x http -i300ms -t5s`，自带间隔重试），没有就退回
+      curl（`hc_check_http`；fw3 那层的 `wait-for` 不用）；
+      ⑤ 裸网通、本机 `nslookup one.one.one.one 127.0.0.1` 也通 → 只是代理坏 → 重启 xray；
+      解析不了 → 连 `dnsmasq-extra` 一起重启（只要存在）；网也断 → 只记日志不动。
+    - 新增依赖 `+curl`（socks 代理检测只能靠 curl，uclient-fetch 不支持）。
+    - **日志只记状态变化**（`hc_log_state`）：健康时最多 `HEALTHCHECK_HEARTBEAT`（1h）一条，
+      问题/重启**每次都记**，状态从 problem 转回 ok 时立刻记一条恢复；状态存
+      `/tmp/.xray_healthcheck.state`（重启即清）。对比 fw3 的每分钟一条 + 3 小时清一次：
+      现在健康时是 1 条/小时，`HEALTHCHECK_LOG` 改成**每天 03:00 清一次**。
+    - 与 fw3 的差异：**没有重启风暴保护**（fw3 也是这样：代理持续坏且裸网正常时每分钟重启一次）。
+
+11. **Statistics 标签页 · 日志部分**（主页面 `s.tab('statistics', ...)`，参考 fw3 的 "System Log" 页；
+    与第 12 条的节点统计同处一个 tab）：
+    只读展示两个日志 —— **Xray Log**（系统日志里 `xray[pid]` 标记的行，滤掉 healthcheck 的：
+    它有自己的日志文件）和 **HealthCheck Log**（`/var/log/xray_healthcheck.log`）。
+    - 取数走 LuCI 的 `fs`：xray 日志 `fs.exec_direct('/usr/libexec/syslog-wrapper')`
+      （LuCI 官方 syslog 页同款入口，比 logread 可移植），healthcheck 日志 `fs.read(...)`；
+      两者都在 `load()` 里取、`render()` 直接填进 `<textarea>`；两个 Refresh 按钮走
+      `form.Button.onclick` 重新取 ✔。
+    - **坑**：`form.DummyValue` 的 `cfgvalue` 在 `rawhtml` 下当 HTML 用，所以日志内容要自己
+      转义（`&`/`<`/`>`）；而且 DummyValue/Button 的 `parse()` 默认会把值**写进 UCI**
+      （DummyValue 会存 `_xray_log = "<textarea…>"`），必须覆写成 `parse = () => Promise.resolve()`。
+    - ACL（`core/root/usr/share/rpcd/acl.d/luci-app-xray.json`）要加 `"cgi-io": ["exec"]`、
+      `"file": { "/usr/libexec/syslog-wrapper": ["exec"], "/var/log/xray_healthcheck.log": ["read"] }`、
+      `"ubus": { "file": ["read","stat"] }`（照抄 luci-mod-status 的 logs 条目）。
+
+12. **Statistics 标签页 · 节点统计部分**（与第 11 条同一个 `s.tab('statistics', ...)`）：显示
+    **每个出站的字节数**（上行/下行/占比）与 balancer 当前选中的节点，数据来自 xray 的 stats API ——
+    也就是"节点命中比例"。要点：
+    - **前提**：`general.stats=1` 且 `general.xray_api=1`（`policy()` 里 `statsOutboundUplink/Downlink`
+      跟着 `stats` 开；`api_conf()` 开 api 入站 + StatsService）。没开时页面只显示提示，
+      不发请求。计数器**从 xray 上次启动开始累计**。
+    - **累计不丢**：xray 的 stats 只在内存里，healthcheck 自愈重启 / 手动 restart 都会清零 →
+      每次**停止**时（`stop_service` → `metrics_archive`）把当前计数累加进
+      `/var/run/xray/metrics.json`（`usr/share/xray/metrics.uc`，Makefile 里 INSTALL_BIN），
+      页面把归档值 + 本次值相加显示。放 `/var/run/xray/` 而不是 `/var/etc/xray/`：后者每次
+      启动都被 `gen_config_file` 的 `rm -f /var/etc/xray/*` 清掉。两者都在 tmpfs，所以只跨
+      xray 重启、不跨路由器重启。
+    - 数据走 app 自己的 rpcd（`ubus call xray statsquery` → `/usr/libexec/rpcd/xray` 里的
+      `xray api $@`，**不接受参数**）→ 返回全部 stat，页面按 `outbound>>><tag>>>traffic>>>(uplink|downlink)`
+      正则过滤、按 **tag 最后一个冒号后的节点名**归并（rus 有 tcp_v6/udp_v4/udp_v6 三个 tag，
+      合成一行）。ACL 要加 `"ubus": { "xray": ["statsquery"] }`。
+    - **占比只作参考**：计数里含 observatory 的探测流量（每节点每秒约一次请求 ≈ 几 KB/s），
+      在流量小时会明显抬高"闲置节点"的占比（实测 100 秒窗口里 gzus 的 2.7 MB 几乎全是探测）。
+      另外 `leastPing` 是"永远选 ping 最低的"、不做轮询，所以正常情况下就是**一个节点吃掉绝大部分**。
+    - **延迟列**：`xray api bi <balancer>` 现在可用 —— `api_conf()` 的 services 里加了
+      `RoutingService`；调用**不再走 rpcd**（那个 helper 不接受参数、读不了带 tag 的 bi），
+      改成视图里 `fs.exec_direct('/usr/bin/xray', ['api','--server=127.0.0.1:8080','bi',<tag>])`
+      （ACL 里加了 `"/usr/bin/xray": ["exec"]`）。四个内置 balancer 各调一次，把返回里所有
+      `{tag, ping|delay|latency}` 递归收集、按节点名（tag 最后一个冒号后）归并取最小；
+      `bi` 的返回结构官方文档没写，所以解析是**防御式**的。stats 也同样改走 exec（同一机制）。
+    - 验证方式：聚合函数是纯 JS（无 LuCI 依赖），可以直接抽出来 `node` 跑单测
+      （用一次真实 `xray api statsquery` 的 JSON 当输入）—— 2026-10-08 就是这么抓到
+      "写进了 uplink/downlink 字段、而聚合读 up/down"导致全 0 的 bug。
+
 ## 架构限制（改之前先读）
 
 - **nft 是预筛，域名规则管不到被它放行的流量**：国内 IP（`Bypassed IP List`）

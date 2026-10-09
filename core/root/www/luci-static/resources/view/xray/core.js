@@ -2,6 +2,7 @@
 'require form';
 'require fs';
 'require network';
+'require rpc';
 'require tools.widgets as widgets';
 'require uci';
 'require view';
@@ -108,12 +109,219 @@ function check_resource_files(load_result) {
     };
 }
 
+/* Logging 标签页：只读展示两个日志，靠 fs 读服务端（ACL 里给了 syslog-wrapper 的 exec 和
+   健康检查日志的 read）。DummyValue 的 cfgvalue 走 rawhtml，所以要自己转义；它的 parse
+   覆写成 no-op，免得保存页面时把这段 HTML 写进 /etc/config/xray_core。 */
+function log_html_escape(s) {
+    return String(s == null ? '' : s)
+        .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function log_rows(text) {
+    return Math.min(40, Math.max(6, String(text || '').split('\n').length + 1));
+}
+
+function log_textarea(id, text) {
+    return `<textarea id="${id}" readonly wrap="off" rows="${log_rows(text)}" style="width:100%;font-size:12px;font-family:monospace">${log_html_escape(text)}</textarea>`;
+}
+
+function log_set(id, text) {
+    const el = document.getElementById(id);
+    if (el != null) {
+        el.value = text || '';
+        el.rows = log_rows(text);
+    }
+}
+
+/* xray 自己的运行日志：系统日志里 xray[pid] 标记的行，去掉 healthcheck 的（它另有日志文件） */
+function log_load_xray() {
+    return fs.exec_direct('/usr/libexec/syslog-wrapper').then(function (data) {
+        return (data || '').split('\n').filter(function (line) {
+            return line.indexOf('xray[') !== -1 && line.indexOf('healthcheck') === -1;
+        }).join('\n');
+    }).catch(function () { return ''; });
+}
+
+function log_load_healthcheck() {
+    return fs.read('/var/log/xray_healthcheck.log').catch(function () { return ''; });
+}
+
+function log_refresh() {
+    return Promise.all([ log_load_xray(), log_load_healthcheck() ]).then(function (logs) {
+        log_set('log_xray', logs[0]);
+        log_set('log_healthcheck', logs[1]);
+    });
+}
+
+/* Nodes 标签页：从 xray 的 stats API（需要 general.stats=1 且 general.xray_api=1）读每个出站的
+   字节数，按节点聚合。注意计数里含 observatory 的探测流量（每节点每秒约一次请求），所以
+   占比只能当参考；计数器从 xray 上次启动开始累计。 */
+const XRAY_API_SERVER = '127.0.0.1:8080';
+
+/* fs.exec_direct 的返回值形态不固定：可能是字符串、已经解析好的对象，或 {code,stdout}
+   这样的包装（不同 LuCI 版本行为不同）—— 三种都吃，别让 JSON.parse(对象) 抛掉。 */
+function as_text(v) {
+    if (v == null) return '';
+    if (typeof v == 'string') return v;
+    if (typeof v == 'object' && typeof v.stdout == 'string') return v.stdout;
+    return String(v);
+}
+
+function as_json(v) {
+    if (v == null) return null;
+    if (typeof v == 'object' && v.stat == null && typeof v.stdout == 'string')
+        v = v.stdout;
+    if (typeof v == 'object') return v;
+    if (typeof v != 'string') return null;
+    try { return JSON.parse(v); } catch (e) { return null; }
+}
+
+/* 直接 exec xray 的 api 子命令（rpcd 那个 helper 不接受参数，读不了带 tag 的 `bi`）。
+   注意 CLI 的顺序是 `xray api <command> [flags] [args]` —— flag 放前面会被当成命令名。 */
+function xray_api_call(command, args) {
+    return fs.exec_direct('/usr/bin/xray',
+            [ 'api', command, '--server=' + XRAY_API_SERVER ].concat(args || []))
+        .catch(function () { return ''; });
+}
+
+/* `xray api bi` 的输出是文本、只有 Override/Selects 两段（CLI 不打印 ping），形如：
+       - Selects:
+         1   tcp_balancer_v4@balancer_outbound:hus
+   这里把形如出站 tag 的 token 收集起来，映射成节点名。 */
+function collect_selections(text, out) {
+    for (const line of String(text || '').split('\n')) {
+        const m = /^\s*\d+\s+(\S+)\s*$/.exec(line);
+        if (m == null) continue;
+        const tag = m[1];
+        if (tag.indexOf('@balancer_outbound:') < 0) continue;
+        out[tag.split(':').pop()] = true;
+    }
+}
+
+function node_stats_enabled() {
+    return uci.get_first(shared.variant, 'general', 'stats') == '1' &&
+           uci.get_first(shared.variant, 'general', 'xray_api') == '1';
+}
+
+function node_stats_aggregate(stats, persisted) {
+    const rows = {};
+
+    for (const item of (stats || [])) {
+        const m = /^outbound>>>(.+)>>>traffic>>>(uplink|downlink)$/.exec(item.name || '');
+        if (m == null) continue;
+        const tag = m[1];
+        const node = tag.indexOf(':') >= 0 ? tag.split(':').pop() : tag;
+        const row = rows[node] || (rows[node] = { name: node, up: 0, down: 0 });
+        row[m[2] == 'uplink' ? 'up' : 'down'] += Number(item.value || 0);
+    }
+
+    /* 加上归档的累计值（xray 每次停止时写进 /var/run/xray/metrics.json）：
+       xray 的 stats 只在内存里，healthcheck 自愈重启 / 手动 restart 都会清零。 */
+    if (persisted != null && persisted.nodes != null) {
+        for (const name in persisted.nodes) {
+            const p = persisted.nodes[name] || {};
+            const row = rows[name] || (rows[name] = { name: name, up: 0, down: 0 });
+            row.up += Number(p.up || 0);
+            row.down += Number(p.down || 0);
+        }
+    }
+
+    const list = Object.keys(rows).map(k => rows[k]);
+    const total = list.reduce((a, r) => a + r.up + r.down, 0);
+    for (const row of list) {
+        row.share = total > 0 ? (100 * (row.up + row.down) / total) : 0;
+    }
+
+    return list.sort((a, b) => (b.up + b.down) - (a.up + a.down));
+}
+
+function node_metrics_load() {
+    return fs.read('/var/run/xray/metrics.json').then(function (raw) {
+        try { return JSON.parse(raw); } catch (e) { return null; }
+    }).catch(function () { return null; });
+}
+
+function node_stats_fetch() {
+    if (!node_stats_enabled()) return Promise.resolve(null);
+
+    const balancer_tags = [ 'tcp_outbound_v4', 'udp_outbound_v4', 'tcp_outbound_v6', 'udp_outbound_v6' ];
+
+    return Promise.all([
+        xray_api_call('statsquery'),
+        Promise.all(balancer_tags.map(t => xray_api_call('bi', [ t ]))),
+        node_metrics_load()
+    ]).then(function (res) {
+        const stats = as_json(res[0]);
+        if (stats == null) return { error: as_text(res[0]) };
+
+        const selected = {};
+        for (const doc of res[1]) collect_selections(as_text(doc), selected);
+
+        const rows = node_stats_aggregate(stats.stat, res[2]);
+        for (const row of rows) row.selected = selected[row.name] === true;
+        return rows;
+    }).catch(function () { return null; });
+}
+
+function node_stats_format(bytes) {
+    const units = [ 'B', 'KB', 'MB', 'GB' ];
+    let n = Number(bytes || 0), u = 0;
+    while (n >= 1024 && u < units.length - 1) { n = n / 1024; u++; }
+    return '%.1f %s'.format(n, units[u]);
+}
+
+function node_stats_html(rows) {
+    if (!node_stats_enabled()) {
+        return '<em>%s</em>'.format(_('Requires <em>Stats</em> and <em>Xray API</em> to be enabled in the extra options.'));
+    }
+    if (rows != null && rows.error != null) {
+        const raw = String(rows.error || '').trim();
+        return '<em>%s</em>%s'.format(_('Unable to read the statistics (is Xray running?).'),
+            raw.length > 0 ? '<br><code style="font-size:11px">' + log_html_escape(raw.substr(0, 300)) + '</code>' : '');
+    }
+    if (!Array.isArray(rows) || rows.length == 0) {
+        return '<em>%s</em>'.format(_('Unable to read the statistics (is Xray running?).'));
+    }
+
+    const cell = 'padding:2px 10px;border-bottom:1px solid #ddd';
+    let html = '<table style="font-size:12px;border-collapse:collapse"><tr>' +
+        [ _('Node'), _('Uplink'), _('Downlink'), _('Share'), _('Selected') ].map(h =>
+            '<th style="text-align:left;padding:2px 10px;border-bottom:1px solid #999">' + h + '</th>').join('') +
+        '</tr>';
+
+    for (const r of rows) {
+        const selected = r.selected ? '\u2714' : '\u2014';
+        html += '<tr><td style="%s"><strong>%s</strong></td><td style="%s">%s</td><td style="%s">%s</td><td style="%s">%.1f%%</td><td style="%s">%s</td></tr>'
+            .format(cell, log_html_escape(r.name), cell, node_stats_format(r.up),
+                    cell, node_stats_format(r.down), cell, r.share, cell, selected);
+    }
+
+    return html + '</table>';
+}
+
+function node_stats_set(rows) {
+    const div = document.getElementById('node_stats_box');
+    if (div != null) div.innerHTML = node_stats_html(rows);
+}
+
+/* 只读展示用：DummyValue/Button 都不该把值写进 UCI */
+function log_no_save() {
+    return Promise.resolve();
+}
+
 return view.extend({
     load: function () {
+        /* node_stats_fetch 要先读 general.stats / xray_api，所以必须等 UCI 加载完再跑；
+           其余取数不受影响、保持并行。（不等的话首次渲染会拿到 null，点 Refresh 才正常。） */
+        const uci_ready = uci.load(shared.variant);
+
         return Promise.all([
-            uci.load(shared.variant),
+            uci_ready,
             fs.list("/usr/share/xray"),
-            network.getHostHints()
+            network.getHostHints(),
+            log_load_xray(),
+            log_load_healthcheck(),
+            uci_ready.then(function () { return node_stats_fetch(); })
         ]);
     },
 
@@ -122,6 +330,9 @@ return view.extend({
         const { xray_bin_default, xray_running } = check_resource_files(load_result[1]);
         const status_text = xray_running ? _("[Xray is running]") : _("[Xray is stopped]");
         const hosts = load_result[2].hosts;
+        const xray_log = load_result[3] || '';
+        const healthcheck_log = load_result[4] || '';
+        const node_stats = load_result[5] || null;
 
         const firewall_mark = uci.get_first(shared.variant, "general", "mark") || '255';
         const m = new form.Map(shared.variant, _('Xray'), status_text);
@@ -154,6 +365,28 @@ return view.extend({
         general_balancer_strategy.value("roundRobin");
         general_balancer_strategy.default = "random";
         general_balancer_strategy.rmempty = false;
+
+        o = s.taboption('general', form.ListValue, 'startup_delay', _('Startup Delay'), _("Wait this long before starting Xray on boot, so that the network and DNS are up first. Only the boot start is delayed; starting or restarting by hand is immediate."));
+        o.value("0", _("Not enabled"));
+        o.value("3", _("3 seconds"));
+        o.value("5", _("5 seconds"));
+        o.value("10", _("10 seconds"));
+        o.value("15", _("15 seconds"));
+        o.value("25", _("25 seconds"));
+        o.value("40", _("40 seconds"));
+        o.default = "5";
+        o.rmempty = false;
+
+        o = s.taboption('general', form.Flag, 'healthcheck_enable', _('Enable HealthCheck'), _("Every minute: check that Xray is running, that the nftables rules are in place and that traffic can actually reach the internet through the proxy. If only the proxy is broken (the network itself works), Xray is restarted; if the local DNS cannot resolve either, dnsmasq-extra is restarted first. Log: <code>/var/log/xray_healthcheck.log</code>, cleared every 3 hours."));
+        o.default = "1";
+
+        o = s.taboption('general', form.ListValue, 'healthcheck_interval', _('HealthCheck Interval'), _("Effective when HealthCheck is enabled."));
+        o.value("60", _("1 minute"));
+        o.value("120", _("2 minutes"));
+        o.value("300", _("5 minutes"));
+        o.value("600", _("10 minutes"));
+        o.default = "60";
+        o.depends('healthcheck_enable', '1');
 
         o = s.taboption('general', form.SectionValue, "xray_servers", form.GridSection, 'servers', _('Xray Servers'), _("Servers are referenced by index (order in the following list). Deleting servers may result in changes of upstream servers actually used by proxy and bridge."));
         ss = o.subsection;
@@ -542,7 +775,7 @@ return view.extend({
             o.value("/usr/bin/xray", _("/usr/bin/xray (default, exist)"));
         }
 
-        o = s.taboption('extra_options', form.ListValue, 'loglevel', _('Log Level'), _('Read Xray log in "System Log" or use <code>logread</code> command.'));
+        o = s.taboption('extra_options', form.ListValue, 'loglevel', _('Log Level'), _('Read Xray log in the <em>Logging</em> tab or use <code>logread</code> command.'));
         o.value("debug");
         o.value("info");
         o.value("warning");
@@ -612,6 +845,44 @@ return view.extend({
         custom_configuration_hook.placeholder = "return function(config) {\n    return config;\n};";
         custom_configuration_hook.monospace = true;
         custom_configuration_hook.rows = 20;
+
+
+
+
+        s.tab('statistics', _('Statistics'));
+
+        o = s.taboption('statistics', form.DummyValue, '_node_stats', _('Node Statistics'), _('Bytes per outbound node, from Xray\'s stats API plus the totals archived in <code>/var/run/xray/metrics.json</code> each time Xray stops (so restarts do not lose them; a router reboot clears them). Counters include the observatory\'s probe traffic, so treat the share as indicative.'));
+        o.rawhtml = true;
+        o.readonly = true;
+        o.parse = log_no_save;
+        o.cfgvalue = function () {
+            return '<div id="node_stats_box">' + node_stats_html(node_stats) + '</div>';
+        };
+
+        o = s.taboption('statistics', form.Button, '_node_stats_refresh', _('Refresh'));
+        o.inputstyle = 'action';
+        o.parse = log_no_save;
+        o.onclick = function () { node_stats_fetch().then(node_stats_set); return false; };
+        o = s.taboption('statistics', form.DummyValue, '_xray_log', _('Xray Log'), _('Log lines of the running Xray process, taken from the system log (healthcheck lines have their own log below). Raise <em>Log Level</em> to log more.'));
+        o.rawhtml = true;
+        o.readonly = true;
+        o.parse = log_no_save;
+        o.cfgvalue = function () { return log_textarea('log_xray', xray_log); };
+
+        o = s.taboption('statistics', form.Button, '_xray_log_refresh', _('Refresh'));
+        o.inputstyle = 'action';
+        o.parse = log_no_save;
+        o.onclick = function () { log_refresh(); return false; };
+        o = s.taboption('statistics', form.DummyValue, '_healthcheck_log', _('HealthCheck Log'), _('Output of <code>/etc/init.d/xray_core healthcheck</code> (<code>/var/log/xray_healthcheck.log</code>, cleared daily). It only records state changes: problems every time, healthy at most once an hour.'));
+        o.rawhtml = true;
+        o.readonly = true;
+        o.parse = log_no_save;
+        o.cfgvalue = function () { return log_textarea('log_healthcheck', healthcheck_log); };
+
+        o = s.taboption('statistics', form.Button, '_healthcheck_log_refresh', _('Refresh'));
+        o.inputstyle = 'action';
+        o.parse = log_no_save;
+        o.onclick = function () { log_refresh(); return false; };
 
         const servers = uci.sections(config_data, "servers");
         for (let selection of [destination, tcp_balancer_v4, tcp_balancer_v6, udp_balancer_v4, udp_balancer_v6, bridge_upstream, force_forward_server_tcp, force_forward_server_udp, dialer_proxy]) {
